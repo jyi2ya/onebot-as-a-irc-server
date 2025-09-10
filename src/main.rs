@@ -83,39 +83,44 @@ async fn handle_irc_messages<IN, OUT, E>(
         let reply = match message.command {
             Command::CAP(_, _, _, _) => Vec::new(),
             Command::WHO(_name, _is_op) => Vec::new(),
-            Command::JOIN(chanlist, chankeys, realname) => {
-                let group_id = parse_prefix_number(&chanlist);
-                let group_name = match bot.get_group_info(group_id, false).await {
-                    Ok(resp) => resp.data["group_name"].as_str().unwrap().to_owned(),
-                    Err(_) => "无法获取群名".to_owned(),
-                };
-                vec![
-                    prefixed(
-                        nick_prefix.clone(),
-                        Message::from(Command::JOIN(chanlist.clone(), chankeys, realname)),
-                    ),
-                    prefixed(
-                        server_prefix.clone(),
-                        Message::from(Command::Response(
-                                Response::RPL_TOPIC,
-                                vec![nick.clone(), chanlist.clone(), group_name],
-                        )),
-                    ),
-                    prefixed(
-                        server_prefix.clone(),
-                        Message::from(Command::Response(
-                                Response::RPL_NAMREPLY,
-                                vec![nick.clone(), chanlist.clone(), format!("{nick}@villv.tech")],
-                        )),
-                    ),
-                    prefixed(
-                        server_prefix.clone(),
-                        Message::from(Command::Response(
-                                Response::RPL_ENDOFNAMES,
-                                vec![nick.clone(), chanlist.clone(), "end of list".to_owned()],
-                        )),
-                    ),
-                    ]
+            Command::JOIN(chanlist, _chankeys, _realname) => {
+                let mut reply = Vec::new();
+                for channel in chanlist.split(',') {
+                    let group_id = parse_prefix_number(channel);
+                    let group_name = match bot.get_group_info(group_id, false).await {
+                        Ok(resp) => resp.data["group_name"].as_str().unwrap().to_owned(),
+                        Err(_) => "无法获取群名".to_owned(),
+                    };
+                    let reply_messages = vec![
+                        prefixed(
+                            nick_prefix.clone(),
+                            Message::from(Command::JOIN(channel.to_owned(), None, None)),
+                        ),
+                        prefixed(
+                            server_prefix.clone(),
+                            Message::from(Command::Response(
+                                    Response::RPL_TOPIC,
+                                    vec![nick.clone(), channel.to_owned(), group_name],
+                            )),
+                        ),
+                        prefixed(
+                            server_prefix.clone(),
+                            Message::from(Command::Response(
+                                    Response::RPL_NAMREPLY,
+                                    vec![nick.clone(), channel.to_owned(), format!("{nick}@villv.tech")],
+                            )),
+                        ),
+                        prefixed(
+                            server_prefix.clone(),
+                            Message::from(Command::Response(
+                                    Response::RPL_ENDOFNAMES,
+                                    vec![nick.clone(), channel.to_owned(), "end of list".to_owned()],
+                            )),
+                        ),
+                    ];
+                    reply.extend(reply_messages);
+                }
+                reply
             }
             Command::ChannelMODE(_modes, _modeparams) => Vec::new(),
             Command::UserMODE(_nickname, _modes) => Vec::new(),
