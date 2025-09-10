@@ -1,0 +1,10 @@
+[package]
+name = "onebot-as-a-irc-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+irc-proto = "1.1.0"
+kovi_broadcast_plugin = { version = "0.1.0", path = "kovi_broadcast_plugin" }
+tokio-util = "0.7.16"
