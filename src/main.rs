@@ -16,6 +16,19 @@ fn prefixed(prefix: Prefix, mut message: Message) -> Message {
     message
 }
 
+fn parse_prefix_number<N>(value: &str) -> N
+where
+    N: std::str::FromStr,
+    <N as std::str::FromStr>::Err: std::fmt::Debug,
+{
+    value
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap()
+}
+
 async fn handle_irc_messages<IN, OUT, E>(
     mut irc_rx: IN,
     irc_tx: Arc<Mutex<OUT>>,
@@ -27,8 +40,8 @@ async fn handle_irc_messages<IN, OUT, E>(
     E: Debug,
     <OUT as futures::Sink<Message>>::Error: std::error::Error + Send + Sync + Debug + 'static,
 {
-    let mut nick = "".to_owned();
-    let mut nick_prefix = Prefix::Nickname("".to_owned(), "".to_owned(), "".to_owned());
+    let mut nick = "rivus".to_owned();
+    let mut nick_prefix = Prefix::Nickname("rivus".to_owned(), "rivus".to_owned(), "villv.tech".to_owned());
     let server_prefix = Prefix::ServerName("onebotirc.villv.tech".to_owned());
     irc_tx
         .lock()
@@ -69,52 +82,54 @@ async fn handle_irc_messages<IN, OUT, E>(
         eprintln!("from user: {message}");
         let reply = match message.command {
             Command::CAP(_, _, _, _) => Vec::new(),
-            Command::JOIN(chanlist, chankeys, realname) => vec![
-                prefixed(
-                    nick_prefix.clone(),
-                    Message::from(Command::JOIN(chanlist.clone(), chankeys, realname)),
-                ),
-                prefixed(
-                    server_prefix.clone(),
-                    Message::from(Command::Response(
-                        Response::RPL_TOPIC,
-                        vec![chanlist.clone(), "TOPIC not implemented yet".to_owned()],
-                    )),
-                ),
-                prefixed(
-                    server_prefix.clone(),
-                    Message::from(Command::Response(
-                        Response::RPL_NAMREPLY,
-                        vec![chanlist.clone(), nick.clone()],
-                    )),
-                ),
-                prefixed(
-                    server_prefix.clone(),
-                    Message::from(Command::Response(
-                        Response::RPL_ENDOFNAMES,
-                        vec![chanlist.clone(), "end of list".to_owned()],
-                    )),
-                ),
-            ],
-            // Some(Message::from(Command::TOPIC( "TOPIC not implemented".to_owned(), None,))),
+            Command::WHO(_name, _is_op) => Vec::new(),
+            Command::JOIN(chanlist, chankeys, realname) => {
+                let group_id = parse_prefix_number(&chanlist);
+                let group_name = match bot.get_group_info(group_id, false).await {
+                    Ok(resp) => resp.data["group_name"].as_str().unwrap().to_owned(),
+                    Err(_) => "无法获取群名".to_owned(),
+                };
+                vec![
+                    prefixed(
+                        nick_prefix.clone(),
+                        Message::from(Command::JOIN(chanlist.clone(), chankeys, realname)),
+                    ),
+                    prefixed(
+                        server_prefix.clone(),
+                        Message::from(Command::Response(
+                                Response::RPL_TOPIC,
+                                vec![nick.clone(), chanlist.clone(), group_name],
+                        )),
+                    ),
+                    prefixed(
+                        server_prefix.clone(),
+                        Message::from(Command::Response(
+                                Response::RPL_NAMREPLY,
+                                vec![nick.clone(), chanlist.clone(), format!("{nick}@villv.tech")],
+                        )),
+                    ),
+                    prefixed(
+                        server_prefix.clone(),
+                        Message::from(Command::Response(
+                                Response::RPL_ENDOFNAMES,
+                                vec![nick.clone(), chanlist.clone(), "end of list".to_owned()],
+                        )),
+                    ),
+                    ]
+            }
             Command::ChannelMODE(_modes, _modeparams) => Vec::new(),
             Command::UserMODE(_nickname, _modes) => Vec::new(),
             Command::WHOIS(_target, _masklist) => vec![prefixed(
                 server_prefix.clone(),
-                Message::from(Command::Response(Response::RPL_WHOISUSER, Vec::new())),
+                Message::from(Command::Response(Response::RPL_WHOISUSER, vec![nick.clone()])),
             )],
             Command::PING(server1, server2) => vec![Message::from(Command::PONG(server1, server2))],
             Command::PRIVMSG(target, message) => {
                 if let Some(stripped) = target.strip_prefix('#') {
-                    let group_id = stripped.parse().unwrap();
+                    let group_id = parse_prefix_number(&stripped);
                     bot.send_group_msg(group_id, message);
                 } else {
-                    let peer_id = target
-                        .chars()
-                        .filter(char::is_ascii_digit)
-                        .collect::<String>()
-                        .parse()
-                        .unwrap();
+                    let peer_id = parse_prefix_number(&target);
                     bot.send_private_msg(peer_id, message);
                 }
                 Vec::new()
@@ -125,7 +140,7 @@ async fn handle_irc_messages<IN, OUT, E>(
             Command::PART(_chanlist, _comment) => Vec::new(),
             Command::NICK(nickname) => {
                 nick = nickname;
-                nick_prefix = Prefix::Nickname(nick.clone(), "".to_owned(), "".to_owned());
+                nick_prefix = Prefix::Nickname(nick.clone(), "rivus".to_owned(), "villv.tech".to_owned());
                 Vec::new()
             }
             Command::USER(_user, _mode, _realname) => Vec::new(),
@@ -139,6 +154,7 @@ async fn handle_irc_messages<IN, OUT, E>(
             }
         };
 
+        eprintln!("server reply: {}", reply.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(""));
         for msg in reply {
             irc_tx.lock().await.feed(msg).await.context("irc connection broken")?;
         }
@@ -169,11 +185,11 @@ where
         let message = match message {
             RenderedOnebotMessage::Group {
                 content,
-                sender_id,
                 sender_name,
                 group_id,
+                ..
             } => Message::new(
-                Some(format!("{sender_id}({sender_name})").as_str()),
+                Some(format!("{sender_name}").as_str()),
                 "PRIVMSG",
                 vec![format!("#{group_id}").as_str(), content.as_str()],
             )
@@ -211,7 +227,7 @@ async fn handle_irc_connection(
     let irc_tx = Arc::new(Mutex::new(irc_tx));
     let shutdown_token = CancellationToken::new();
     let _shutdown_after_return = shutdown_token.drop_guard_ref();
-    tokio::select!{
+    tokio::select! {
         _ = tokio::spawn(handle_irc_messages(
                 irc_rx,
                 irc_tx.clone(),

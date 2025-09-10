@@ -26,13 +26,13 @@ impl From<&kovi::MsgEvent> for RenderedOnebotMessage {
             .collect();
         if value.is_private() {
             Self::Private {
-                content: value.get_text(),
+                content: value.human_text.clone(),
                 sender_id: value.sender.user_id,
                 sender_name
             }
         } else {
             Self::Group {
-                content: value.get_text(),
+                content: value.human_text.clone(),
                 sender_id: value.sender.user_id,
                 group_id: value.group_id.unwrap(),
                 sender_name
