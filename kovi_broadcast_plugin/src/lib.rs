@@ -19,18 +19,23 @@ pub enum RenderedOnebotMessage {
 
 impl From<&kovi::MsgEvent> for RenderedOnebotMessage {
     fn from(value: &kovi::MsgEvent) -> Self {
+        let sender_name = value
+            .get_sender_nickname()
+            .chars()
+            .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+            .collect();
         if value.is_private() {
             Self::Private {
                 content: value.get_text(),
                 sender_id: value.sender.user_id,
-                sender_name: value.get_sender_nickname(),
+                sender_name
             }
         } else {
             Self::Group {
                 content: value.get_text(),
                 sender_id: value.sender.user_id,
-                sender_name: value.get_sender_nickname(),
                 group_id: value.group_id.unwrap(),
+                sender_name
             }
         }
     }

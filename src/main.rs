@@ -8,6 +8,8 @@ use kovi_broadcast_plugin::kovi::tokio;
 use kovi_broadcast_plugin::{RenderedOnebotMessage, kovi};
 use tokio::sync::Mutex;
 use tokio_util::codec::Decoder;
+use tokio_util::sync::CancellationToken;
+use anyhow::Context;
 
 fn prefixed(prefix: Prefix, mut message: Message) -> Message {
     message.prefix = Some(prefix);
@@ -18,12 +20,12 @@ async fn handle_irc_messages<IN, OUT, E>(
     mut irc_rx: IN,
     irc_tx: Arc<Mutex<OUT>>,
     bot: Arc<kovi::RuntimeBot>,
-    quit_notifier: tokio::sync::oneshot::Sender<()>,
-) where
+    cancel_signal: CancellationToken,
+) -> anyhow::Result<()> where
     IN: Stream<Item = Result<Message, E>> + Unpin,
     OUT: Sink<Message> + Unpin,
     E: Debug,
-    <OUT as futures::Sink<Message>>::Error: Debug,
+    <OUT as futures::Sink<Message>>::Error: std::error::Error + Send + Sync + Debug + 'static,
 {
     let mut nick = "".to_owned();
     let mut nick_prefix = Prefix::Nickname("".to_owned(), "".to_owned(), "".to_owned());
@@ -40,11 +42,26 @@ async fn handle_irc_messages<IN, OUT, E>(
         ))
         .await
         .unwrap();
-    while let Some(next_frame) = irc_rx.next().await {
+    loop {
+        let next_item = tokio::select! {
+            _ = cancel_signal.cancelled() => {
+                return Ok(());
+            },
+            next_item = irc_rx.next() => next_item,
+        };
+
+        let next_frame = match next_item {
+            Some(frame) => frame,
+            None => {
+                log::info!("irc client closed");
+                return Ok(());
+            }
+        };
+
         let message = match next_frame {
             Ok(message) => message,
             Err(err) => {
-                dbg!(err);
+                log::warn!("invaid irc message received: {:?}", err);
                 continue;
             }
         };
@@ -105,6 +122,7 @@ async fn handle_irc_messages<IN, OUT, E>(
             Command::QUIT(_message) => {
                 break;
             }
+            Command::PART(_chanlist, _comment) => Vec::new(),
             Command::NICK(nickname) => {
                 nick = nickname;
                 nick_prefix = Prefix::Nickname(nick.clone(), "".to_owned(), "".to_owned());
@@ -122,23 +140,32 @@ async fn handle_irc_messages<IN, OUT, E>(
         };
 
         for msg in reply {
-            irc_tx.lock().await.feed(msg).await.unwrap();
+            irc_tx.lock().await.feed(msg).await.context("irc connection broken")?;
         }
-        irc_tx.lock().await.flush().await.unwrap();
+        irc_tx.lock().await.flush().await.context("irc connection broken")?;
     }
-    quit_notifier.send(()).unwrap();
+
+    Ok(())
 }
 
 async fn handle_onebot_messages<OUT>(
     mut onebot_rx: tokio::sync::broadcast::Receiver<RenderedOnebotMessage>,
     irc_tx: Arc<Mutex<OUT>>,
-    quit_signal: tokio::sync::oneshot::Receiver<()>,
-) where
+    cancel_signal: CancellationToken,
+) -> anyhow::Result<()>
+where
     OUT: Sink<Message> + Unpin,
-    <OUT as futures::Sink<irc_proto::Message>>::Error: std::fmt::Debug,
+    <OUT as futures::Sink<Message>>::Error: std::error::Error + Send + Sync + Debug + 'static,
 {
-    while quit_signal.is_empty() {
-        let message = onebot_rx.recv().await.unwrap();
+    loop {
+        let recv_item = tokio::select! {
+            _ = cancel_signal.cancelled() => {
+                return Ok(());
+            }
+            recv_item = onebot_rx.recv() => recv_item,
+        };
+
+        let message = recv_item.context("onebot closed")?;
         let message = match message {
             RenderedOnebotMessage::Group {
                 content,
@@ -150,22 +177,53 @@ async fn handle_onebot_messages<OUT>(
                 "PRIVMSG",
                 vec![format!("#{group_id}").as_str(), content.as_str()],
             )
-            .unwrap(),
-            RenderedOnebotMessage::Private {
-                content,
-                sender_id,
-                sender_name,
-            } => Message::new(
-                Some(format!("{sender_id}({sender_name})").as_str()),
-                "PRIVMSG",
-                vec![sender_id.to_string().as_str(), content.as_str()],
-            )
-            .unwrap(),
+                .unwrap(),
+                RenderedOnebotMessage::Private {
+                    content,
+                    sender_id,
+                    sender_name,
+                } => Message::new(
+                    Some(format!("{sender_id}({sender_name})").as_str()),
+                    "PRIVMSG",
+                    vec![sender_id.to_string().as_str(), content.as_str()],
+                )
+                    .unwrap(),
         };
         eprintln!("from onebot: {message}");
-        irc_tx.lock().await.send(message).await.unwrap();
+        irc_tx.lock().await.send(message).await.context("irc client disconnected")?;
     }
-    log::info!("onebot message handler quit");
+}
+
+async fn handle_irc_connection(
+    conn: tokio::net::TcpStream,
+    onebot_rx: tokio::sync::broadcast::Receiver<RenderedOnebotMessage>
+) {
+    let codec = irc_proto::IrcCodec::new("irc_codec").unwrap();
+    let irc_conn = codec.framed(conn);
+    let (irc_tx, irc_rx) = irc_conn.split();
+    let bot = loop {
+        if let Some(bot) = kovi_broadcast_plugin::RUNTIME_BOT.get() {
+            break bot.clone();
+        }
+        tokio::task::yield_now().await;
+    };
+
+    let irc_tx = Arc::new(Mutex::new(irc_tx));
+    let shutdown_token = CancellationToken::new();
+    let _shutdown_after_return = shutdown_token.drop_guard_ref();
+    tokio::select!{
+        _ = tokio::spawn(handle_irc_messages(
+                irc_rx,
+                irc_tx.clone(),
+                bot,
+                shutdown_token.clone(),
+        )) => (),
+        _ = tokio::spawn(handle_onebot_messages(
+                onebot_rx,
+                irc_tx.clone(),
+                shutdown_token.clone(),
+        )) => (),
+    };
 }
 
 async fn irc_server_main(
@@ -175,30 +233,7 @@ async fn irc_server_main(
     let acceptor = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     while let Ok((conn, peer)) = acceptor.accept().await {
         log::info!("incoming connection: {peer}");
-        let codec = irc_proto::IrcCodec::new("irc_codec").unwrap();
-        let irc_conn = codec.framed(conn);
-        let (irc_tx, irc_rx) = irc_conn.split();
-        let onebot_rx = broadcast_tx.subscribe();
-        let bot = loop {
-            if let Some(bot) = kovi_broadcast_plugin::RUNTIME_BOT.get() {
-                break bot.clone();
-            }
-            tokio::task::yield_now().await;
-        };
-
-        let irc_tx = Arc::new(Mutex::new(irc_tx));
-        let (quit_notifier, quit_signal) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(handle_irc_messages(
-            irc_rx,
-            irc_tx.clone(),
-            bot,
-            quit_notifier,
-        ));
-        tokio::spawn(handle_onebot_messages(
-            onebot_rx,
-            irc_tx.clone(),
-            quit_signal,
-        ));
+        handle_irc_connection(conn, broadcast_tx.subscribe()).await;
     }
 }
 
