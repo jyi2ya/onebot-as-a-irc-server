@@ -9,3 +9,10 @@
 
 [1]: https://www.napcat.wiki/onebot/network#_2-2-napcatqq-%E4%BD%9C%E4%B8%BA-websocket-%E6%9C%8D%E5%8A%A1%E5%99%A8%E6%8E%A5%E6%94%B6%E4%BA%8B%E4%BB%B6%E5%92%8C%E8%AF%B7%E6%B1%82
 [2]: 其它客户端好像不工作，hexchat 和 thunderbird 都不行，不知道为啥，如果有懂的希望能帮我修修……
+
+====
+谢谢
+====
+
+* ThriceCola/Kovi: https://github.com/ThriceCola/Kovi
+* aatxe/irc: https://github.com/aatxe/irc
