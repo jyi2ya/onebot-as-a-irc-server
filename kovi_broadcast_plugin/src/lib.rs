@@ -5,13 +5,13 @@ use kovi::tokio;
 #[derive(Debug, Clone)]
 pub enum RenderedOnebotMessage {
     Group {
-        content: String,
+        content: Vec<String>,
         sender_id: i64,
         sender_name: String,
         group_id: i64,
     },
     Private {
-        content: String,
+        content: Vec<String>,
         sender_id: i64,
         sender_name: String,
     },
@@ -26,13 +26,13 @@ impl From<&kovi::MsgEvent> for RenderedOnebotMessage {
             .collect();
         if value.is_private() {
             Self::Private {
-                content: value.human_text.clone(),
+                content: value.human_text.split('\n').map(str::to_owned).collect(),
                 sender_id: value.sender.user_id,
                 sender_name
             }
         } else {
             Self::Group {
-                content: value.human_text.clone(),
+                content: value.human_text.split('\n').map(str::to_owned).collect(),
                 sender_id: value.sender.user_id,
                 group_id: value.group_id.unwrap(),
                 sender_name

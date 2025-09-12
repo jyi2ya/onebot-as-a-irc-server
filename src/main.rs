@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use irc_proto::{Command, Message, Prefix, Response};
 use kovi::log;
@@ -9,14 +10,13 @@ use kovi_broadcast_plugin::{RenderedOnebotMessage, kovi};
 use tokio::sync::Mutex;
 use tokio_util::codec::Decoder;
 use tokio_util::sync::CancellationToken;
-use anyhow::Context;
 
 fn prefixed(prefix: Prefix, mut message: Message) -> Message {
     message.prefix = Some(prefix);
     message
 }
 
-fn parse_prefix_number<N>(value: &str) -> N
+fn parse_prefix_number<N>(value: &str) -> Option<N>
 where
     N: std::str::FromStr,
     <N as std::str::FromStr>::Err: std::fmt::Debug,
@@ -26,7 +26,7 @@ where
         .filter(char::is_ascii_digit)
         .collect::<String>()
         .parse()
-        .unwrap()
+        .ok()
 }
 
 async fn handle_irc_messages<IN, OUT, E>(
@@ -34,14 +34,19 @@ async fn handle_irc_messages<IN, OUT, E>(
     irc_tx: Arc<Mutex<OUT>>,
     bot: Arc<kovi::RuntimeBot>,
     cancel_signal: CancellationToken,
-) -> anyhow::Result<()> where
+) -> anyhow::Result<()>
+where
     IN: Stream<Item = Result<Message, E>> + Unpin,
     OUT: Sink<Message> + Unpin,
     E: Debug,
     <OUT as futures::Sink<Message>>::Error: std::error::Error + Send + Sync + Debug + 'static,
 {
     let mut nick = "rivus".to_owned();
-    let mut nick_prefix = Prefix::Nickname("rivus".to_owned(), "rivus".to_owned(), "villv.tech".to_owned());
+    let mut nick_prefix = Prefix::Nickname(
+        "rivus".to_owned(),
+        "rivus".to_owned(),
+        "villv.tech".to_owned(),
+    );
     let server_prefix = Prefix::ServerName("onebotirc.villv.tech".to_owned());
     irc_tx
         .lock()
@@ -86,7 +91,11 @@ async fn handle_irc_messages<IN, OUT, E>(
             Command::JOIN(chanlist, _chankeys, _realname) => {
                 let mut reply = Vec::new();
                 for channel in chanlist.split(',') {
-                    let group_id = parse_prefix_number(channel);
+                    let group_id = if let Some(id) = parse_prefix_number(channel) {
+                        id
+                    } else {
+                        continue;
+                    };
                     let group_name = match bot.get_group_info(group_id, false).await {
                         Ok(resp) => resp.data["group_name"].as_str().unwrap().to_owned(),
                         Err(_) => "无法获取群名".to_owned(),
@@ -99,22 +108,26 @@ async fn handle_irc_messages<IN, OUT, E>(
                         prefixed(
                             server_prefix.clone(),
                             Message::from(Command::Response(
-                                    Response::RPL_TOPIC,
-                                    vec![nick.clone(), channel.to_owned(), group_name],
+                                Response::RPL_TOPIC,
+                                vec![nick.clone(), channel.to_owned(), group_name],
                             )),
                         ),
                         prefixed(
                             server_prefix.clone(),
                             Message::from(Command::Response(
-                                    Response::RPL_NAMREPLY,
-                                    vec![nick.clone(), channel.to_owned(), format!("{nick}@villv.tech")],
+                                Response::RPL_NAMREPLY,
+                                vec![
+                                    nick.clone(),
+                                    channel.to_owned(),
+                                    format!("{nick}@villv.tech"),
+                                ],
                             )),
                         ),
                         prefixed(
                             server_prefix.clone(),
                             Message::from(Command::Response(
-                                    Response::RPL_ENDOFNAMES,
-                                    vec![nick.clone(), channel.to_owned(), "end of list".to_owned()],
+                                Response::RPL_ENDOFNAMES,
+                                vec![nick.clone(), channel.to_owned(), "end of list".to_owned()],
                             )),
                         ),
                     ];
@@ -126,15 +139,18 @@ async fn handle_irc_messages<IN, OUT, E>(
             Command::UserMODE(_nickname, _modes) => Vec::new(),
             Command::WHOIS(_target, _masklist) => vec![prefixed(
                 server_prefix.clone(),
-                Message::from(Command::Response(Response::RPL_WHOISUSER, vec![nick.clone()])),
+                Message::from(Command::Response(
+                    Response::RPL_WHOISUSER,
+                    vec![nick.clone()],
+                )),
             )],
             Command::PING(server1, server2) => vec![Message::from(Command::PONG(server1, server2))],
             Command::PRIVMSG(target, message) => {
                 if let Some(stripped) = target.strip_prefix('#') {
-                    let group_id = parse_prefix_number(&stripped);
+                    let group_id = parse_prefix_number(stripped).unwrap();
                     bot.send_group_msg(group_id, message);
                 } else {
-                    let peer_id = parse_prefix_number(&target);
+                    let peer_id = parse_prefix_number(&target).unwrap();
                     bot.send_private_msg(peer_id, message);
                 }
                 Vec::new()
@@ -145,7 +161,8 @@ async fn handle_irc_messages<IN, OUT, E>(
             Command::PART(_chanlist, _comment) => Vec::new(),
             Command::NICK(nickname) => {
                 nick = nickname;
-                nick_prefix = Prefix::Nickname(nick.clone(), "rivus".to_owned(), "villv.tech".to_owned());
+                nick_prefix =
+                    Prefix::Nickname(nick.clone(), "rivus".to_owned(), "villv.tech".to_owned());
                 Vec::new()
             }
             Command::USER(_user, _mode, _realname) => Vec::new(),
@@ -159,11 +176,28 @@ async fn handle_irc_messages<IN, OUT, E>(
             }
         };
 
-        eprintln!("server reply: {}", reply.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(""));
+        eprintln!(
+            "server reply: {}",
+            reply
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join("")
+        );
         for msg in reply {
-            irc_tx.lock().await.feed(msg).await.context("irc connection broken")?;
+            irc_tx
+                .lock()
+                .await
+                .feed(msg)
+                .await
+                .context("irc connection broken")?;
         }
-        irc_tx.lock().await.flush().await.context("irc connection broken")?;
+        irc_tx
+            .lock()
+            .await
+            .flush()
+            .await
+            .context("irc connection broken")?;
     }
 
     Ok(())
@@ -187,37 +221,71 @@ where
         };
 
         let message = recv_item.context("onebot closed")?;
-        let message = match message {
+        let messages: Vec<_> = match message {
             RenderedOnebotMessage::Group {
                 content,
                 sender_name,
                 group_id,
+                sender_id,
                 ..
-            } => Message::new(
-                Some(format!("{sender_name}").as_str()),
-                "PRIVMSG",
-                vec![format!("#{group_id}").as_str(), content.as_str()],
-            )
-                .unwrap(),
-                RenderedOnebotMessage::Private {
-                    content,
-                    sender_id,
-                    sender_name,
-                } => Message::new(
-                    Some(format!("{sender_id}({sender_name})").as_str()),
-                    "PRIVMSG",
-                    vec![sender_id.to_string().as_str(), content.as_str()],
-                )
-                    .unwrap(),
+            } => {
+                let nick_prefix = Prefix::Nickname(
+                    sender_name.to_owned(),
+                    sender_id.to_string(),
+                    "villv.tech".to_owned(),
+                );
+                content
+                    .into_iter()
+                    .map(|content| {
+                        prefixed(
+                            nick_prefix.clone(),
+                            Message::from(Command::PRIVMSG(format!("#{group_id}"), content)),
+                        )
+                    })
+                    .collect()
+            }
+            RenderedOnebotMessage::Private {
+                content,
+                sender_id,
+                sender_name,
+            } => {
+                let nick_prefix = Prefix::Nickname(
+                    sender_name.to_owned(),
+                    sender_id.to_string(),
+                    "villv.tech".to_owned(),
+                );
+                content
+                    .into_iter()
+                    .map(|content| {
+                        prefixed(
+                            nick_prefix.clone(),
+                            Message::from(Command::PRIVMSG("rivus".to_owned(), content)),
+                        )
+                    })
+                    .collect()
+            }
         };
-        eprintln!("from onebot: {message}");
-        irc_tx.lock().await.send(message).await.context("irc client disconnected")?;
+
+        for msg in messages {
+            irc_tx
+                .lock()
+                .await
+                .feed(msg)
+                .await
+                .context("irc connection broken")?;
+        }
+        irc_tx
+            .lock()
+            .await
+            .flush()
+            .await
+            .context("irc connection broken")?;
     }
 }
 
 async fn handle_irc_connection(
     conn: tokio::net::TcpStream,
-    onebot_rx: tokio::sync::broadcast::Receiver<RenderedOnebotMessage>
+    onebot_rx: tokio::sync::broadcast::Receiver<RenderedOnebotMessage>,
 ) {
     let codec = irc_proto::IrcCodec::new("irc_codec").unwrap();
     let irc_conn = codec.framed(conn);
