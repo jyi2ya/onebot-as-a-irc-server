@@ -1,3 +1,9 @@
+!! NO LONGER MAINTANIED !!
+
+SEE: https://github.com/jyi2ya/kovi-plugin-irc-gateway
+
+---
+
 ========
 如何使用
 ========
